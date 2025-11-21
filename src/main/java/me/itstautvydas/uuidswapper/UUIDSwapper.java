@@ -36,8 +36,9 @@ public class UUIDSwapper {
     private final Logger logger;
     private final ProxyServer server; // 強制接続のためにProxyServerインスタンスを保持
 
-    // サーバー移動情報を一時保存するためのマップ。再接続を待機しているプレイヤーを追跡します。
-    // Key: プレイヤーのユーザー名 (String), Value: 目標サーバーとカスタムUUID/ユーザー名
+    // サーバー移動情報を一時保存するためのマップ。
+    // Key: プレイヤーのユーザー名 (String) (ServerPreConnect時) または新しいUUIDの文字列 (GameProfileRequest後)
+    // Value: 目標サーバーとカスタムUUID/ユーザー名
     private final ConcurrentMap<String, TargetInfo> pendingSwaps = new ConcurrentHashMap<>();
 
     // サーバー移動時の情報を保持する内部クラス
@@ -144,23 +145,31 @@ public class UUIDSwapper {
     public void onGameProfileRequest(GameProfileRequestEvent event) {
         var profile = event.getGameProfile();
         String playerName = profile.getName();
+        UUID originalPlayerId = profile.getId();
 
         // 1. pendingSwapsに情報があるか確認（再接続かどうか）
-        // キーをユーザー名に変更
+        // キーはユーザー名を使用
         TargetInfo info = pendingSwaps.get(playerName);
 
         String newUsername = null;
         String newUUIDStr = null;
         boolean isSwapping = false;
 
-        if (info != null) {
+        // FloodgateなどのプラグインによるUUIDの上書きは発生するが、
+        // 再接続のトリガーがplayerNameの存在のみで十分であるため、
+        // originalPlayerIdと保存されたoriginalUUIDの一致チェックは行わない。
+        if (info != null) { // ★修正点：infoが存在すれば再接続と見なす
             // ★ 再接続時（サーバー移動によるUUID変更要求）
             // pendingSwapsに保存されたカスタムUUID/ユーザー名を適用
             newUsername = info.customUsername;
             newUUIDStr = info.customUUID;
             isSwapping = true;
             logger.info("UUID swap activated for re-connect to server {}. Applying specific profile.", info.targetServerName);
-            // 情報を pendingSwaps から削除 (ServerConnectedEventではplayerIdで再度取得するため)
+
+            // 情報をpendingSwapsから削除
+            // ここで削除してしまうと、次のServerPreConnectで情報がなくなってしまう。
+            // 情報を新しいUUIDをキーとして再登録し、ServerPreConnectで削除するのが正しい。
+            pendingSwaps.remove(playerName); // 一旦ここで削除 (再登録が下で行われるため)
 
         } else {
             // ★ 初回接続時（default設定のみ適用）
@@ -168,7 +177,6 @@ public class UUIDSwapper {
             final String serverName = "default";
             newUsername = getSwappedValueForServer(config.customPlayerNames, profile, serverName);
             newUUIDStr = getSwappedValueForServer(config.swappedUuids, profile, serverName);
-            // 初回接続では、UUIDはdefaultに設定されますが、pendingSwapsには保存しません。
             logger.info("UUID swap applied for initial connection (default).");
         }
 
@@ -177,64 +185,76 @@ public class UUIDSwapper {
             var newProfile = createProfile(newUsername, newUUIDStr, profile);
             event.setGameProfile(newProfile);
 
-            logger.info("Player's ({} {}) new profile is:", event.getUsername(), profile.getId());
+            logger.info("Player's ({} {}) new profile is:", event.getUsername(), originalPlayerId);
             if (newUsername != null)
                 logger.info(" # Username => {}", newUsername);
             if (newUUIDStr != null)
                 logger.info(" # Unique ID => {}", newUUIDStr);
 
-            // 2. UUIDが変更された場合、ServerConnectedEventで取得するために新しいUUIDと情報を再登録する (重要)
+            // 2. UUIDが変更された場合、ServerPreConnectEventで転送先をオーバーライドするために、新しいUUIDをキーとして再登録する (重要)
             if (isSwapping && newUUIDStr != null) {
-                // 情報を pendingSwaps から削除（ユーザー名キー）
-                pendingSwaps.remove(playerName);
 
-                // ServerConnectedEvent で Player.getUniqueId() (新しいUUID) をキーとして使用できるように
-                // TargetInfo に古い UUID を含めておく必要はもうないため、新しい UUID をキーとして TargetInfo を保存し直します。
                 UUID newPlayerId = UUID.fromString(newUUIDStr);
 
                 // TargetInfoを新しいUUIDと、元のUUID (info.originalUUID) を含めて再作成する
-                // NOTE: TargetInfoはUUIDを保存していないため、元のinfoを再利用します。
                 TargetInfo updatedInfo = new TargetInfo(info.targetServerName, newUUIDStr, newUsername, info.originalUUID);
 
-                pendingSwaps.put(newPlayerId.toString(), updatedInfo); // 新しいUUIDをStringとしてキーに
+                // 新しいUUIDの文字列をキーとして情報を保存し直す
+                // これにより、ServerPreConnectEventで新しいUUIDをキーとして取得できる
+                pendingSwaps.put(newPlayerId.toString(), updatedInfo);
                 logger.info("Updated pendingSwaps key from {} (name) to {} (new UUID string).", playerName, newPlayerId);
             }
         }
     }
 
     /**
-     * ServerPreConnectEvent: サーバー移動要求を検出し、UUID変更が必要な場合は切断を指示します。
+     * ServerPreConnectEvent:
+     * 1. サーバー移動要求を検出し、UUID変更が必要な場合は切断を指示します。
+     * 2. 再接続時、デフォルトサーバーへの接続を検知し、目的のサーバーへ転送先をオーバーライドします。
      */
     @Subscribe
     public void onServerPreConnect(ServerPreConnectEvent event) {
         // 接続許可の確認
         if (!event.getResult().isAllowed()) return;
 
-        // 既に再接続中（pendingSwapsに情報がある）の場合は何もしない。
-        // ※この時点では、pendingSwapsのキーはユーザー名か、新しいUUID (String) のいずれかになっている可能性があるため、
-        // ユーザー名でチェック
-        if (pendingSwaps.containsKey(event.getPlayer().getUsername())) {
-            return;
-        }
-
-        // Velocity API の定義に基づき、getOriginalServer() で目標サーバーを取得
+        var player = event.getPlayer();
+        // 現在のプレイヤーのUUID（GameProfileRequestEventで変更された後のUUID）
+        String currentPlayerKey = player.getUniqueId().toString();
         RegisteredServer targetServer = event.getOriginalServer();
         String targetServerName = targetServer.getServerInfo().getName();
 
-        var player = event.getPlayer();
-        var profile = player.getGameProfile();
-        // NOTE: この時点のprofile.getId() は、GameProfileRequestEventで適用されたdefaultUUID（または元のUUID）です。
+        // **A. 再接続時の転送先オーバーライド**
+        // GameProfileRequestEventでUUIDが変更された後の、デフォルトサーバーへの接続試行を検知
+        if (pendingSwaps.containsKey(currentPlayerKey)) {
+            // UUIDの変更が完了した後の、デフォルトサーバーへの接続試行である
+            TargetInfo info = pendingSwaps.get(currentPlayerKey);
+
+            logger.info("Interception: Player {} (new UUID {}) is being redirected from {} to {}.",
+                    player.getUsername(), currentPlayerKey, targetServerName, info.targetServerName);
+
+            // 転送先をオーバーライド
+            server.getServer(info.targetServerName).ifPresentOrElse(target -> {
+                event.setResult(ServerPreConnectEvent.ServerResult.allowed(target));
+            }, () -> {
+                logger.error("Failed to find target server {} for post-swap redirection.", info.targetServerName);
+            });
+
+            // UUIDの変更と転送先オーバーライドが完了したので、情報を削除
+            pendingSwaps.remove(currentPlayerKey);
+            return;
+        }
+
+        // **B. 初回接続時/通常時の切断判定ロジック**
 
         // 接続先サーバー用のカスタムUUIDとユーザー名を取得
-        String newUUIDStr = getSwappedValueForServer(config.swappedUuids, profile, targetServerName);
-        String newUsername = getSwappedValueForServer(config.customPlayerNames, profile, targetServerName);
+        String newUUIDStr = getSwappedValueForServer(config.swappedUuids, player.getGameProfile(), targetServerName);
+        String newUsername = getSwappedValueForServer(config.customPlayerNames, player.getGameProfile(), targetServerName);
 
         // 比較用に default の値を取得
-        String defaultUUIDStr = getSwappedValueForServer(config.swappedUuids, profile, "default");
-        String defaultUsername = getSwappedValueForServer(config.customPlayerNames, profile, "default");
+        String defaultUUIDStr = getSwappedValueForServer(config.swappedUuids, player.getGameProfile(), "default");
+        String defaultUsername = getSwappedValueForServer(config.customPlayerNames, player.getGameProfile(), "default");
 
         // UUIDまたはユーザー名が default 設定と異なる場合に再接続ロジックを起動
-        // default設定が存在しない場合は null vs newUUIDStr != null の比較になり、設定があれば true
         boolean uuidChanged = (newUUIDStr != null && !newUUIDStr.equals(defaultUUIDStr)) ||
                 (newUUIDStr != null && defaultUUIDStr == null);
         boolean usernameChanged = (newUsername != null && !newUsername.equals(defaultUsername)) ||
@@ -245,49 +265,43 @@ public class UUIDSwapper {
             String finalCustomUUID = (newUUIDStr != null) ? newUUIDStr : defaultUUIDStr;
             String finalCustomUsername = (newUsername != null) ? newUsername : defaultUsername;
 
-            // 1. 移動情報を一時保存 (引数の順序を修正: targetServerName, customUUID, customUsername, originalUUID)
-            // キーはプレイヤー名を使用
+            // 1. 移動情報を一時保存 (キーはプレイヤー名を使用)
             TargetInfo info = new TargetInfo(targetServerName, finalCustomUUID, finalCustomUsername, player.getUniqueId());
-
-            // キーは現在のプレイヤーのユーザー名を使用
             pendingSwaps.put(player.getUsername(), info);
 
-            logger.info("Player {} requested server {}. Preparing for UUID change via re-connect.", profile.getName(), targetServerName);
+            logger.info("Player {} requested server {}. Preparing for UUID/Username change via re-connect.", player.getUsername(), targetServerName);
 
             // 2. サーバー移動をキャンセルし、切断を指示（再接続を促す）
             event.setResult(ServerPreConnectEvent.ServerResult.denied());
 
             // プレイヤーが再接続すると、GameProfileRequestEvent が再度トリガーされます
-            event.getPlayer().disconnect(Component.text("§c[UUID Swapper] UUIDを更新するため再接続が必要です。"));
+            player.disconnect(Component.text("§c[UUID Swapper] UUIDを更新するため再接続が必要です。"));
         }
     }
 
     /**
-     * ServerConnectedEvent: 接続完了後、一時情報を削除し、目的のサーバーへ転送します。
-     * UUIDスワップが成功した場合、プレイヤーのUUIDはカスタム値に変更されていることに注意。
+     * ServerConnectedEvent は、ServerPreConnectで転送をオーバーライドしたため、
+     * ここでは保険的な処理のみ行い、通常はスキップされます。
      */
     @Subscribe
     public void onServerConnected(ServerConnectedEvent event) {
-        // Playerオブジェクトから取得されるUUIDは、GameProfileRequestEventで設定された新しいUUIDです
+        // Playerオブジェクトから取得されるUUIDは、カスタムUUIDのはず
         UUID playerId = event.getPlayer().getUniqueId();
         String playerIdString = playerId.toString();
 
-        // pendingSwapsに情報があるか確認
-        // onGameProfileRequest で新しいUUID (String) にキーが更新されているはず
+        // pendingSwapsに情報があるか確認（ServerPreConnectで削除済みのはず）
         if (pendingSwaps.containsKey(playerIdString)) {
+            // このブロックは実行されるべきではありません。実行された場合、ServerPreConnectの転送に失敗した可能性があります。
             TargetInfo info = pendingSwaps.remove(playerIdString);
 
-            logger.info("Successfully swapped UUID. Now attempting to connect player {} to server {}.", event.getPlayer().getUsername(), info.targetServerName);
+            logger.warn("ServerConnectedEvent triggered for transfer, but ServerPreConnect should have handled it. Manually connecting to {}.", info.targetServerName);
 
-            // 目的のサーバーに強制的に転送する
+            // 目的のサーバーに強制的に転送する (保険)
             server.getServer(info.targetServerName).ifPresentOrElse(targetServer -> {
-                // 強制転送を実行
                 event.getPlayer().createConnectionRequest(targetServer).connect();
             }, () -> {
-                logger.error("Failed to find target server {} for post-swap connection.", info.targetServerName);
+                logger.error("Failed to find target server {} during ServerConnected fallback.", info.targetServerName);
             });
-
-            logger.info("Removing temporary data for {}.", info.targetServerName);
         }
     }
 }
