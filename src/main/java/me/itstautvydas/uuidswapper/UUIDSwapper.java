@@ -143,6 +143,7 @@ public class UUIDSwapper {
     }
 
     // コンフィグ検索用メソッド
+    // ★修正点: 取得した値が空文字("")の場合は null を返して「変更なし」とする
     public String getSwappedValueByKey(Map<String, Map<String, Object>> map, String originalUsername, UUID originalUUID, String serverName) {
         Object entryObject = map.get("u:" + originalUsername);
         if (entryObject == null) {
@@ -162,13 +163,21 @@ public class UUIDSwapper {
         if (entryObject instanceof Map) {
             @SuppressWarnings("unchecked")
             Map<String, Object> entryMap = (Map<String, Object>) entryObject;
+
             var serverSpecificValue = entryMap.get(serverName);
-            if (serverSpecificValue != null) return serverSpecificValue.toString();
+            if (serverSpecificValue != null) {
+                String val = serverSpecificValue.toString();
+                return val.isEmpty() ? null : val;
+            }
 
             var defaultValue = entryMap.get("default");
-            if (defaultValue != null) return defaultValue.toString();
+            if (defaultValue != null) {
+                String val = defaultValue.toString();
+                return val.isEmpty() ? null : val;
+            }
         } else if (entryObject instanceof String) {
-            return entryObject.toString();
+            String val = entryObject.toString();
+            return val.isEmpty() ? null : val;
         }
 
         return null;
@@ -189,6 +198,7 @@ public class UUIDSwapper {
 
         if (info != null) {
             // 再接続時（pendingSwapsの情報を使用）
+            // info内の値がnullの場合は、変更なし（元の値を使う）を意味する
             newUsername = info.customUsername;
             newUUIDStr = info.customUUID;
             isSwapping = true;
@@ -213,7 +223,9 @@ public class UUIDSwapper {
                 newUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, serverName);
             }
 
-            logger.info("UUID swap applied for initial connection (default/override).");
+            if (newUsername != null || newUUIDStr != null) {
+                logger.info("UUID swap applied for initial connection (default/override).");
+            }
         }
 
         if (newUsername != null || newUUIDStr != null) {
@@ -229,6 +241,7 @@ public class UUIDSwapper {
                 pendingSwaps.put(newPlayerId.toString(), updatedInfo);
             }
         } else {
+            // 変更なしの場合もセッション情報を保存
             sessions.put(profile.getId(), new SessionData(originalUsername, originalUUID));
         }
     }
@@ -269,6 +282,7 @@ public class UUIDSwapper {
         }
 
         // 2. コンフィグからの取得（オーバーライドがない場合）
+        // 空文字設定の場合は null が返ってくる
         if (requiredUUIDStr == null) {
             requiredUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, targetServerName);
             if (requiredUUIDStr == null) {
@@ -286,8 +300,13 @@ public class UUIDSwapper {
         String currentUUIDStr = player.getUniqueId().toString();
         String currentUsername = player.getUsername();
 
-        boolean uuidChanged = requiredUUIDStr != null && !requiredUUIDStr.equals(currentUUIDStr);
-        boolean usernameChanged = requiredUsername != null && !requiredUsername.equals(currentUsername);
+        // ★修正: 設定がない(null)場合は、期待値を「元の値(Original)」とする
+        String expectedUUIDStr = (requiredUUIDStr != null) ? requiredUUIDStr : originalUUID.toString();
+        String expectedUsername = (requiredUsername != null) ? requiredUsername : originalUsername;
+
+        // 現在の値と期待値が異なる場合に切断
+        boolean uuidChanged = !currentUUIDStr.equals(expectedUUIDStr);
+        boolean usernameChanged = !currentUsername.equals(expectedUsername);
 
         if (uuidChanged || usernameChanged) {
             TargetInfo info = new TargetInfo(targetServerName, requiredUUIDStr, requiredUsername, originalUUID);
@@ -322,22 +341,21 @@ public class UUIDSwapper {
         // オーバーライドのクリーンアップ
         if (overrides.containsKey(originalUUID)) {
             overrides.remove(originalUUID);
-            // オーバーライド適用時はリセット処理をスキップ
             return;
         }
 
-        // デフォルトに戻す判定
+        // デフォルトに戻す判定（またはサーバー固有設定への変更）
         String defaultUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, "default");
         String targetUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, currentServerName);
 
-        if (defaultUUIDStr == null) return;
         if (targetUUIDStr == null) targetUUIDStr = defaultUUIDStr;
 
-        if (!currentIdStr.equals(defaultUUIDStr)) {
-            if (!currentIdStr.equals(targetUUIDStr)) {
-                logger.info("Triggering disconnect to revert UUID for {}.", originalUsername);
-                player.disconnect(Component.text("§c[UUID Swapper] UUIDをリセットするため再接続が必要です。"));
-            }
+        // ★修正: ターゲット設定がなければ元のUUIDを期待値とする
+        String expectedUUIDStr = (targetUUIDStr != null) ? targetUUIDStr : originalUUID.toString();
+
+        if (!currentIdStr.equals(expectedUUIDStr)) {
+            logger.info("Triggering disconnect to revert/update UUID for {}.", originalUsername);
+            player.disconnect(Component.text("§c[UUID Swapper] UUIDを更新するため再接続が必要です。"));
         }
     }
 
@@ -480,7 +498,6 @@ public class UUIDSwapper {
             }
 
             // 現在のサーバーに再接続するために情報を保存して切断
-            // requiredValueがnullの場合は変更なし（またはデフォルト）として扱う
             TargetInfo info = new TargetInfo(targetServerName, requiredUUIDStr, requiredUsername, originalUUID);
             pendingSwaps.put(originalUsername, info);
 
