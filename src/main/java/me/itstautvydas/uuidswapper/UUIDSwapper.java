@@ -2,6 +2,8 @@ package me.itstautvydas.uuidswapper;
 
 import com.google.inject.Inject;
 import com.moandjiezana.toml.Toml;
+import com.velocitypowered.api.command.CommandManager;
+import com.velocitypowered.api.command.SimpleCommand;
 import com.velocitypowered.api.event.player.GameProfileRequestEvent;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.connection.DisconnectEvent;
@@ -11,15 +13,19 @@ import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.ProxyServer;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
+import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.util.GameProfile;
 import me.itstautvydas.BuildConstants;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
 import org.slf4j.Logger;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -33,9 +39,10 @@ import java.util.concurrent.ConcurrentMap;
         authors ={"ItsTauTvyDas"})
 public class UUIDSwapper {
 
-    private final Configuration config;
+    private Configuration config; // Reloadに対応するため final を削除
     private final Logger logger;
     private final ProxyServer server;
+    private final Path dataDirectory;
 
     // サーバー移動情報を一時保存するためのマップ（再接続用）
     private final ConcurrentMap<String, TargetInfo> pendingSwaps = new ConcurrentHashMap<>();
@@ -43,6 +50,10 @@ public class UUIDSwapper {
     // 現在接続中のプレイヤーの「元の情報」を保持するマップ
     // Key: 現在(入れ替え後)のUUID, Value: 元のプロフィール情報
     private final ConcurrentMap<UUID, SessionData> sessions = new ConcurrentHashMap<>();
+
+    // コマンドによる一時的なオーバーライド情報を保持するマップ
+    // Key: 元のUUID, Value: 一時的なオーバーライド情報
+    private final ConcurrentMap<UUID, TemporaryOverride> overrides = new ConcurrentHashMap<>();
 
     // 再接続待ちの情報
     public static class TargetInfo {
@@ -70,32 +81,59 @@ public class UUIDSwapper {
         }
     }
 
+    // 一時的なオーバーライド情報
+    public static class TemporaryOverride {
+        String customUUID;
+        String customUsername;
+
+        public TemporaryOverride(String customUUID, String customUsername) {
+            this.customUUID = customUUID;
+            this.customUsername = customUsername;
+        }
+    }
+
     @Inject
-    public UUIDSwapper(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory) throws IOException {
+    public UUIDSwapper(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory, CommandManager commandManager) throws IOException {
         this.server = server;
         this.logger = logger;
+        this.dataDirectory = dataDirectory;
 
         if (Files.notExists(dataDirectory))
             Files.createDirectories(dataDirectory);
 
-        Path configFile = dataDirectory.resolve("config.toml");
-        if (Files.notExists(configFile)) {
-            try (InputStream in = getClass().getClassLoader().getResourceAsStream("config.toml")) {
-                if (in != null) {
-                    logger.info("Copying new configuration...");
-                    Files.copy(in, configFile);
+        // 初期設定読み込み
+        loadConfig();
+
+        // コマンドの登録
+        commandManager.register(commandManager.metaBuilder("changeUUID").plugin(this).build(), new ChangeUUIDCommand());
+        commandManager.register(commandManager.metaBuilder("changePlayername").plugin(this).build(), new ChangePlayernameCommand());
+        commandManager.register(commandManager.metaBuilder("changeNow").plugin(this).build(), new ChangeNowCommand());
+        commandManager.register(commandManager.metaBuilder("swapuuid:creload").plugin(this).build(), new ReloadCommand());
+    }
+
+    // 設定読み込み処理をメソッド化
+    private void loadConfig() {
+        try {
+            Path configFile = dataDirectory.resolve("config.toml");
+            if (Files.notExists(configFile)) {
+                try (InputStream in = getClass().getClassLoader().getResourceAsStream("config.toml")) {
+                    if (in != null) {
+                        logger.info("Copying new configuration...");
+                        Files.copy(in, configFile);
+                    }
                 }
             }
+
+            var toml = new Toml().read(configFile.toFile());
+            this.config = toml.to(Configuration.class);
+
+            this.config.swappedUuids = (Map) toml.getTable("swapped-uuids").toMap();
+            this.config.customPlayerNames = (Map) toml.getTable("custom-player-names").toMap();
+
+            logger.info("Configuration loaded.");
+        } catch (Exception e) {
+            logger.error("Failed to load configuration.", e);
         }
-
-        var toml = new Toml().read(configFile.toFile());
-        config = toml.to(Configuration.class);
-
-        config.swappedUuids = (Map) toml.getTable("swapped-uuids").toMap();
-        config.customPlayerNames = (Map) toml.getTable("custom-player-names").toMap();
-
-        logger.info("Configuration loaded.");
-        // ... logging omitted ...
     }
 
     public GameProfile createProfile(String username, String uuid, GameProfile profile) {
@@ -140,7 +178,6 @@ public class UUIDSwapper {
     public void onGameProfileRequest(GameProfileRequestEvent event) {
         var profile = event.getGameProfile();
 
-        // ここで取得できる情報は、クライアントから送られてきた「本当のオリジナル情報」です。
         String originalUsername = profile.getName();
         UUID originalUUID = profile.getId();
 
@@ -151,7 +188,7 @@ public class UUIDSwapper {
         boolean isSwapping = false;
 
         if (info != null) {
-            // 再接続時
+            // 再接続時（pendingSwapsの情報を使用）
             newUsername = info.customUsername;
             newUUIDStr = info.customUUID;
             isSwapping = true;
@@ -160,17 +197,29 @@ public class UUIDSwapper {
         } else {
             // 初回接続時
             final String serverName = "default";
-            newUsername = getSwappedValueByKey(config.customPlayerNames, originalUsername, originalUUID, serverName);
-            newUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, serverName);
-            logger.info("UUID swap applied for initial connection (default).");
+
+            // オーバーライドチェック（初回接続から適用したい場合）
+            TemporaryOverride override = overrides.get(originalUUID);
+
+            if (override != null && override.customUsername != null) {
+                newUsername = override.customUsername;
+            } else {
+                newUsername = getSwappedValueByKey(config.customPlayerNames, originalUsername, originalUUID, serverName);
+            }
+
+            if (override != null && override.customUUID != null) {
+                newUUIDStr = override.customUUID;
+            } else {
+                newUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, serverName);
+            }
+
+            logger.info("UUID swap applied for initial connection (default/override).");
         }
 
         if (newUsername != null || newUUIDStr != null) {
             var newProfile = createProfile(newUsername, newUUIDStr, profile);
             event.setGameProfile(newProfile);
 
-            // ★ 重要: 入れ替え後のUUIDをキーにして、元の情報をセッションマップに保存
-            // これにより、後で「usagimaru21」から「androidpotato」を逆引きできるようにする
             UUID resultingUUID = newProfile.getId();
             sessions.put(resultingUUID, new SessionData(originalUsername, originalUUID));
 
@@ -180,7 +229,6 @@ public class UUIDSwapper {
                 pendingSwaps.put(newPlayerId.toString(), updatedInfo);
             }
         } else {
-            // 変更がない場合でもセッション情報は保存しておく（検索のため）
             sessions.put(profile.getId(), new SessionData(originalUsername, originalUUID));
         }
     }
@@ -206,31 +254,43 @@ public class UUIDSwapper {
         RegisteredServer targetServer = event.getOriginalServer();
         String targetServerName = targetServer.getServerInfo().getName();
 
-        // ★ 修正: Playerから直接名前を取るのではなく、sessionsから「元の名前」を取得して検索に使用する
         SessionData session = sessions.get(player.getUniqueId());
-
-        // セッション情報がない場合は、現在の情報をそのまま使う（フォールバック）
         String originalUsername = (session != null) ? session.originalUsername : player.getUsername();
         UUID originalUUID = (session != null) ? session.originalUUID : player.getUniqueId();
 
-        String requiredUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, targetServerName);
-        String requiredUsername = getSwappedValueByKey(config.customPlayerNames, originalUsername, originalUUID, targetServerName);
+        String requiredUUIDStr = null;
+        String requiredUsername = null;
 
-        String defaultUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, "default");
-        String defaultUsername = getSwappedValueByKey(config.customPlayerNames, originalUsername, originalUUID, "default");
+        // 1. オーバーライドの確認
+        TemporaryOverride override = overrides.get(originalUUID);
+        if (override != null) {
+            if (override.customUUID != null) requiredUUIDStr = override.customUUID;
+            if (override.customUsername != null) requiredUsername = override.customUsername;
+        }
 
-        if (requiredUUIDStr == null) requiredUUIDStr = defaultUUIDStr;
-        if (requiredUsername == null) requiredUsername = defaultUsername;
+        // 2. コンフィグからの取得（オーバーライドがない場合）
+        if (requiredUUIDStr == null) {
+            requiredUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, targetServerName);
+            if (requiredUUIDStr == null) {
+                requiredUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, "default");
+            }
+        }
+
+        if (requiredUsername == null) {
+            requiredUsername = getSwappedValueByKey(config.customPlayerNames, originalUsername, originalUUID, targetServerName);
+            if (requiredUsername == null) {
+                requiredUsername = getSwappedValueByKey(config.customPlayerNames, originalUsername, originalUUID, "default");
+            }
+        }
 
         String currentUUIDStr = player.getUniqueId().toString();
-        String currentUsername = player.getUsername(); // 現在の表示名
+        String currentUsername = player.getUsername();
 
         boolean uuidChanged = requiredUUIDStr != null && !requiredUUIDStr.equals(currentUUIDStr);
         boolean usernameChanged = requiredUsername != null && !requiredUsername.equals(currentUsername);
 
         if (uuidChanged || usernameChanged) {
             TargetInfo info = new TargetInfo(targetServerName, requiredUUIDStr, requiredUsername, originalUUID);
-            // 再接続時は元の名前で検索するため、originalUsernameをキーにする
             pendingSwaps.put(originalUsername, info);
 
             logger.info("Player {} (Original: {}) requested server {}. Disconnecting for update.",
@@ -247,6 +307,7 @@ public class UUIDSwapper {
         String currentIdStr = player.getUniqueId().toString();
         String currentServerName = event.getServer().getServerInfo().getName();
 
+        // 転送フォールバック
         if (pendingSwaps.containsKey(currentIdStr)) {
             TargetInfo info = pendingSwaps.remove(currentIdStr);
             server.getServer(info.targetServerName).ifPresent(target ->
@@ -254,11 +315,18 @@ public class UUIDSwapper {
             return;
         }
 
-        // デフォルトに戻す判定
         SessionData session = sessions.get(player.getUniqueId());
         String originalUsername = (session != null) ? session.originalUsername : player.getUsername();
         UUID originalUUID = (session != null) ? session.originalUUID : player.getUniqueId();
 
+        // オーバーライドのクリーンアップ
+        if (overrides.containsKey(originalUUID)) {
+            overrides.remove(originalUUID);
+            // オーバーライド適用時はリセット処理をスキップ
+            return;
+        }
+
+        // デフォルトに戻す判定
         String defaultUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, "default");
         String targetUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, currentServerName);
 
@@ -273,9 +341,175 @@ public class UUIDSwapper {
         }
     }
 
-    // 退出時にセッション情報を削除
     @Subscribe
     public void onDisconnect(DisconnectEvent event) {
-        sessions.remove(event.getPlayer().getUniqueId());
+        UUID uuid = event.getPlayer().getUniqueId();
+        SessionData session = sessions.remove(uuid);
+        if (session != null) {
+            overrides.remove(session.originalUUID);
+        }
+    }
+
+    // --- コマンドクラス ---
+
+    // /changeUUID <uuid>
+    private class ChangeUUIDCommand implements SimpleCommand {
+        @Override
+        public void execute(Invocation invocation) {
+            if (!hasPermission(invocation)) {
+                invocation.source().sendMessage(Component.text("You do not have permission to execute this command.", NamedTextColor.RED));
+                return;
+            }
+            if (!(invocation.source() instanceof Player)) {
+                invocation.source().sendMessage(Component.text("This command can only be executed by a player.", NamedTextColor.RED));
+                return;
+            }
+            Player player = (Player) invocation.source();
+            String[] args = invocation.arguments();
+
+            if (args.length != 1) {
+                player.sendMessage(Component.text("Usage: /changeUUID <uuid>", NamedTextColor.RED));
+                return;
+            }
+
+            SessionData session = sessions.get(player.getUniqueId());
+            UUID originalUUID = (session != null) ? session.originalUUID : player.getUniqueId();
+
+            overrides.compute(originalUUID, (k, v) -> {
+                if (v == null) return new TemporaryOverride(args[0], null);
+                v.customUUID = args[0];
+                return v;
+            });
+
+            player.sendMessage(Component.text("UUID override set to " + args[0] + ". Switch servers to apply.", NamedTextColor.GREEN));
+        }
+
+        @Override
+        public boolean hasPermission(final Invocation invocation) {
+            return invocation.source().hasPermission("uuidswapper.command.change");
+        }
+    }
+
+    // /changePlayername <name>
+    private class ChangePlayernameCommand implements SimpleCommand {
+        @Override
+        public void execute(Invocation invocation) {
+            if (!hasPermission(invocation)) {
+                invocation.source().sendMessage(Component.text("You do not have permission to execute this command.", NamedTextColor.RED));
+                return;
+            }
+            if (!(invocation.source() instanceof Player)) {
+                invocation.source().sendMessage(Component.text("This command can only be executed by a player.", NamedTextColor.RED));
+                return;
+            }
+            Player player = (Player) invocation.source();
+            String[] args = invocation.arguments();
+
+            if (args.length != 1) {
+                player.sendMessage(Component.text("Usage: /changePlayername <name>", NamedTextColor.RED));
+                return;
+            }
+
+            SessionData session = sessions.get(player.getUniqueId());
+            UUID originalUUID = (session != null) ? session.originalUUID : player.getUniqueId();
+
+            overrides.compute(originalUUID, (k, v) -> {
+                if (v == null) return new TemporaryOverride(null, args[0]);
+                v.customUsername = args[0];
+                return v;
+            });
+
+            player.sendMessage(Component.text("Username override set to " + args[0] + ". Switch servers to apply.", NamedTextColor.GREEN));
+        }
+
+        @Override
+        public boolean hasPermission(final Invocation invocation) {
+            return invocation.source().hasPermission("uuidswapper.command.change");
+        }
+    }
+
+    // /changeNow (現在のサーバーで即時適用)
+    private class ChangeNowCommand implements SimpleCommand {
+        @Override
+        public void execute(Invocation invocation) {
+            if (!hasPermission(invocation)) {
+                invocation.source().sendMessage(Component.text("You do not have permission to execute this command.", NamedTextColor.RED));
+                return;
+            }
+            if (!(invocation.source() instanceof Player)) {
+                invocation.source().sendMessage(Component.text("This command can only be executed by a player.", NamedTextColor.RED));
+                return;
+            }
+            Player player = (Player) invocation.source();
+
+            if (player.getCurrentServer().isEmpty()) {
+                player.sendMessage(Component.text("You are not connected to any server.", NamedTextColor.RED));
+                return;
+            }
+
+            // 現在のサーバーを取得
+            String targetServerName = player.getCurrentServer().get().getServerInfo().getName();
+
+            SessionData session = sessions.get(player.getUniqueId());
+            String originalUsername = (session != null) ? session.originalUsername : player.getUsername();
+            UUID originalUUID = (session != null) ? session.originalUUID : player.getUniqueId();
+
+            String requiredUUIDStr = null;
+            String requiredUsername = null;
+
+            // 1. オーバーライドの確認
+            TemporaryOverride override = overrides.get(originalUUID);
+            if (override != null) {
+                if (override.customUUID != null) requiredUUIDStr = override.customUUID;
+                if (override.customUsername != null) requiredUsername = override.customUsername;
+            }
+
+            // 2. コンフィグからの取得
+            if (requiredUUIDStr == null) {
+                requiredUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, targetServerName);
+                if (requiredUUIDStr == null) {
+                    requiredUUIDStr = getSwappedValueByKey(config.swappedUuids, originalUsername, originalUUID, "default");
+                }
+            }
+
+            if (requiredUsername == null) {
+                requiredUsername = getSwappedValueByKey(config.customPlayerNames, originalUsername, originalUUID, targetServerName);
+                if (requiredUsername == null) {
+                    requiredUsername = getSwappedValueByKey(config.customPlayerNames, originalUsername, originalUUID, "default");
+                }
+            }
+
+            // 現在のサーバーに再接続するために情報を保存して切断
+            // requiredValueがnullの場合は変更なし（またはデフォルト）として扱う
+            TargetInfo info = new TargetInfo(targetServerName, requiredUUIDStr, requiredUsername, originalUUID);
+            pendingSwaps.put(originalUsername, info);
+
+            logger.info("Player {} executing /changeNow for server {}. Disconnecting for update.", originalUsername, targetServerName);
+            player.disconnect(Component.text("§c[UUID Swapper] 設定を即時適用するため再接続します..."));
+        }
+
+        @Override
+        public boolean hasPermission(final Invocation invocation) {
+            return invocation.source().hasPermission("uuidswapper.command.change");
+        }
+    }
+
+    // /swapuuid:creload (設定リロード)
+    private class ReloadCommand implements SimpleCommand {
+        @Override
+        public void execute(Invocation invocation) {
+            if (!hasPermission(invocation)) {
+                invocation.source().sendMessage(Component.text("You do not have permission to execute this command.", NamedTextColor.RED));
+                return;
+            }
+
+            loadConfig();
+            invocation.source().sendMessage(Component.text("UUID Swapper configuration reloaded.", NamedTextColor.GREEN));
+        }
+
+        @Override
+        public boolean hasPermission(final Invocation invocation) {
+            return invocation.source().hasPermission("uuidswapper.command.admin");
+        }
     }
 }
