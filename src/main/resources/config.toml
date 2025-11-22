@@ -9,12 +9,15 @@ swap-uuids = true
 # UUID swapping
 # If you want to use usernames, add u: prefix
 [swapped-uuids]
-#"u:ItsTauTvyDas" = "96642c39-6de2-3b20-a133-b354dcc36016"
-#"cfe17913-ebc3-3cfb-9162-99908590f8f2" = "aacb3ea4-8b3d-3830-8dc0-11a765a0de3a"
+#"u:androidpotato" = { default = "6a7b6452-ccd1-46a8-87b0-627ff930c818" }
+#"u:androidpotato" = { default = "6a7b6452-ccd1-46a8-87b0-627ff930c818", mod1 = "03b90e2e-7397-35a0-ad43-e4ab6a9d1a97", pa1 = "87b4317f-c223-3ad9-96a2-3ee4a0415f28" }
+#"u:androidpotato" = { default = "", mod1 = "03b90e2e-7397-35a0-ad43-e4ab6a9d1a97", pa1 = "87b4317f-c223-3ad9-96a2-3ee4a0415f28" }
+
 
 # Set custom player names
 # If you use UUID that has been previously swapped, use here the original
 # For usernames, add u: prefix
 [custom-player-names]
-#"96642c39-6de2-3b20-a133-b354dcc36016" = "Herobrine"
-#"u:Steve" = "Steve1"
+#"u:androidpotato" = { default = "", pa1 = "abcdefg", mod1 = "OfflinePotato" }
+#"u:.androidP2653" = {default = "bedrockpotato1"}
+#"00000000-0000-0000-0009-01f55a02cedb" = {default = "bedrockpotato1"}
