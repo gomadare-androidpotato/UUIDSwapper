@@ -19,7 +19,7 @@ You can temporarily override the spoofing destination by ignoring the config usi
 # Commands
 The following commands are also implemented  
 /changeuuid UUID in hexadecimal with a hyphen  
-/changeusername Username to change  
+/changeplayername Username to change  
 /changenow Apply changes immediately  
 /swapuuid:creload Instantly reload the configuration without rebooting  
   
